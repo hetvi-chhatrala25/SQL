@@ -35,6 +35,7 @@ create table orders (
     total_amount decimal(12,2) not null default 0,
     status enum('Pending', 'Shipped', 'Delivered', 'Cancelled')
         default 'Pending',
+    cancelled_at datetime default null,
     foreign key (customer_id) references customers(customer_id),
     check (total_amount >= 0)
 );
@@ -567,3 +568,95 @@ group by o.order_id, o.total_amount
 order by o.order_id;
 
 show tables;
+
+delimiter $$
+
+create procedure place_order(
+    in p_customer_id int,
+    in p_product_id int,
+    in p_quantity int
+)
+begin
+    declare v_price decimal(10,2);
+    declare v_stock int;
+    declare v_order_id int;
+    declare v_total decimal(12,2);
+
+    declare exit handler for sqlexception
+    begin
+        rollback;
+        resignal;
+    end;
+
+    if p_quantity <= 0 then
+        signal sqlstate '45000'
+            set message_text = 'Order quantity must be greater than zero';
+    end if;
+
+    start transaction;
+
+    select price, stock_quantity
+    into v_price, v_stock
+    from products
+    where product_id = p_product_id
+    for update;
+
+    if v_stock < p_quantity then
+        signal sqlstate '45000'
+            set message_text = 'Insufficient stock for this order';
+    end if;
+
+    set v_total = v_price * p_quantity;
+
+    insert into orders (customer_id, order_date, total_amount, status)
+    values (p_customer_id, current_timestamp, v_total, 'Pending');
+
+    set v_order_id = last_insert_id();
+
+    insert into order_items (order_id, product_id, quantity, subtotal)
+    values (v_order_id, p_product_id, p_quantity, v_total);
+
+    update products
+    set stock_quantity = stock_quantity - p_quantity
+    where product_id = p_product_id;
+
+    commit;
+end$$
+
+delimiter ;
+
+call place_order(6, 9, 2);
+
+drop procedure place_order;
+
+update orders
+set cancelled_at = '2026-09-15 15:00:00'
+where order_id = 9
+  and status = 'Cancelled'
+  and cancelled_at is null;
+
+start transaction;
+
+delete oi
+from order_items oi
+join orders o on oi.order_id = o.order_id
+where o.status = 'Cancelled'
+  and o.cancelled_at < date_sub(current_timestamp, interval 30 day);
+
+delete p
+from payments p
+join orders o on p.order_id = o.order_id
+where o.status = 'Cancelled'
+  and o.cancelled_at < date_sub(current_timestamp, interval 30 day);
+
+delete s
+from shipping s
+join orders o on s.order_id = o.order_id
+where o.status = 'Cancelled'
+  and o.cancelled_at < date_sub(current_timestamp, interval 30 day);
+
+delete from orders
+where status = 'Cancelled'
+  and cancelled_at < date_sub(current_timestamp, interval 30 day);
+
+commit;
